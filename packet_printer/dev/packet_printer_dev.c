@@ -60,7 +60,7 @@ static void restore_cq_ctx(cq_ctx_t *cq_ctx,
 static void print_packet_chars(const char *data, uint32_t size) {
 	for(int i = 0; i < size; i++) {
 		flexio_dev_print("%c", data[i]);
-		if(i % 8 == 0) {
+		if(i % 64 == 0) {
 			flexio_dev_print("\n");
 		}
 	}
