@@ -15,6 +15,7 @@
 #include <stddef.h>
 #include <dpaintrin.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "../packet_printer_com.h"
 #include "libflexio-dev/flexio_dev.h"
@@ -80,6 +81,16 @@ static inline uint16_t be16(const uint8_t *p)
  * transport protocol is TCP or UDP.  Silently returns for non-IPv4
  * frames or truncated packets.
  */
+
+char *get_src_ip(const char *data, uint32_t size) {
+	char *out;
+	const uint8_t *p = (const uint8_t *)data;
+	const uint8_t *ip  = p + ETH_HDR_LEN;
+	const uint8_t *s = ip + IP_SRC_OFFSET;
+	sprintf(out, "%u.%u.%u.%u", s[0], s[1], s[2], s[3]);
+	return out;
+}
+
 static void check_for_packet_type(const char *data, uint32_t size)
 {
 	const uint8_t *p = (const uint8_t *)data;
