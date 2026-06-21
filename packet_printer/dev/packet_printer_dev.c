@@ -91,6 +91,15 @@ char *get_src_ip(const char *data, uint32_t size) {
 	return out;
 }
 
+char *get_dst_ip(const char *data, uint32_t size) {
+	char *out;
+	const uint8_t *p = (const uint8_t *)data;
+	const uint8_t *ip  = p + ETH_HDR_LEN;
+	const uint8_t *d = ip + IP_DST_OFFSET;
+	sprintf(out, "%u.%u.%u.%u", d[0], d[1], d[2], d[3]);
+	return out;
+}
+
 static void check_for_packet_type(const char *data, uint32_t size)
 {
 	const uint8_t *p = (const uint8_t *)data;
