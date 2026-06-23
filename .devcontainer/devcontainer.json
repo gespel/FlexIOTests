@@ -1,0 +1,36 @@
+{
+    "name": "DOCA FlexIO Development",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "DOCA_VERSION": "3.3.0"
+        }
+    },
+    "runArgs": [
+        "--privileged",
+        "--network=host",
+        "--ulimit", "memlock=-1"
+    ],
+    "mounts": [
+        "source=/dev,target=/dev,type=bind,consistency=cached"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-extension-pack",
+                "mesonbuild.mesonbuild"
+            ],
+            "settings": {
+                "C_Cpp.default.compilerPath": "/usr/bin/gcc",
+                "C_Cpp.default.includePath": [
+                    "${workspaceFolder}/**",
+                    "/usr/include",
+                    "/usr/local/include"
+                ]
+            }
+        }
+    },
+    "postCreateCommand": "echo 'DOCA FlexIO devcontainer ready. Build with: meson setup build && cd build && ninja'",
+    "remoteUser": "root"
+}
