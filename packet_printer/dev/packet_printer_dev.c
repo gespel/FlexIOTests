@@ -100,28 +100,27 @@ char *get_dst_ip(const char *data, uint32_t size) {
 	return out;
 }
 
-static void check_for_packet_type(const char *data, uint32_t size)
+static int check_for_packet_type(const char *data, uint32_t size)
 {
 	const uint8_t *p = (const uint8_t *)data;
 
 	/* Need at least Ethernet + minimum IPv4 header (20 bytes) */
 	if (size < ETH_HDR_LEN + 20)
-		return;
+		return -1;
 
 	if (be16(p + ETH_ETYPE_OFFSET) != ETYPE_IPV4)
-		return;
+		return -1;
 
 	const uint8_t *ip  = p + ETH_HDR_LEN;
 	uint8_t        ihl = (ip[IP_IHL_OFFSET] & 0x0F) * 4;
 	uint8_t        proto = ip[IP_PROTO_OFFSET];
 
 	if (proto != IP_PROTO_TCP && proto != IP_PROTO_UDP)
-		return;
+		return -1;
 
 	/* Need enough bytes to reach the first two port fields */
 	if (size < (uint32_t)(ETH_HDR_LEN + ihl + 4))
-		return;
-
+		return -1;
 	const uint8_t *transport = ip + ihl;
 	uint16_t src_port = be16(transport + TRANSPORT_SRC_PORT_OFFSET);
 	uint16_t dst_port = be16(transport + TRANSPORT_DST_PORT_OFFSET);
@@ -134,11 +133,14 @@ static void check_for_packet_type(const char *data, uint32_t size)
 		flexio_dev_print("TCP: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
 				 s[0], s[1], s[2], s[3], src_port,
 				 d[0], d[1], d[2], d[3], dst_port);
+				 return 1;
 	} else {
 		flexio_dev_print("UDP: %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u\n",
 				 s[0], s[1], s[2], s[3], src_port,
 				 d[0], d[1], d[2], d[3], dst_port);
+				 return 2;
 	}
+	return -1;
 }
 
 /*
