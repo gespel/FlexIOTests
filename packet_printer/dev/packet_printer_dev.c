@@ -12,10 +12,10 @@
 #include "com_dev.h"
 #include <libflexio-dev/flexio_dev_err.h>
 #include <libflexio-dev/flexio_dev_queue_access.h>
+#include <libflexio-libc/string.h>
 #include <stddef.h>
 #include <dpaintrin.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "../packet_printer_com.h"
 #include "libflexio-dev/flexio_dev.h"
@@ -24,6 +24,10 @@
 #define CQ_IDX_MASK ((1 << LOG_CQ_DEPTH) - 1)
 /* Mask for indexing into the RQ (Receive Queue) ring */
 #define RQ_IDX_MASK ((1 << LOG_RQ_DEPTH) - 1)
+/* Mask for indexing into the SQ (Send Queue) segment ring (depth × 4 segs per WQE) */
+#define SQ_IDX_MASK  ((1 << (LOG_SQ_DEPTH + LOG_SQE_NUM_SEGS)) - 1)
+/* Mask for indexing into the SQ TX data buffer (one slot per SQ WQE) */
+#define DATA_IDX_MASK ((1 << LOG_SQ_DEPTH) - 1)
 
 /* Maximum bytes of packet content to print per packet */
 #define PRINT_MAX_BYTES 64
@@ -44,6 +48,66 @@
 /* TCP/UDP: src port at byte 0, dst port at byte 2 of transport header */
 #define TRANSPORT_SRC_PORT_OFFSET 0
 #define TRANSPORT_DST_PORT_OFFSET 2
+
+/* SQ (Send Queue) state — static so it persists across DPA handler invocations */
+static sq_ctx_t sq_ctx;
+static dt_ctx_t dt_ctx;
+static uint32_t sq_lkey;
+
+/*
+ * Copy a TCP packet to the SQ TX buffer, insert a VLAN tag (IDS_MIRROR_VLAN_ID)
+ * after the src/dst MACs, and post a Send WQE.
+ *
+ * The VLAN tag causes the eSwitch to deliver the packet to the dedicated
+ * VLAN subinterface on the ARM (e.g. "ids0") instead of the normal interface,
+ * so DPA-forwarded copies are trivially distinguishable from regular traffic.
+ *
+ * Wire format after insertion:
+ *   [dst MAC 6B][src MAC 6B][0x8100 2B][VLAN TCI 2B][orig EtherType+payload]
+ */
+static void forward_tcp_packet(const char *rq_data, uint32_t data_sz)
+{
+	union flexio_dev_sqe_seg *swqe;
+	char *sq_data;
+	uint32_t tagged_sz = data_sz + 4;  /* 4 extra bytes for the VLAN tag */
+
+	sq_data = get_next_dte(&dt_ctx, DATA_IDX_MASK, LOG_WQD_CHUNK_BSIZE);
+
+	/* Copy dst MAC + src MAC (first 12 bytes) unchanged */
+	memcpy(sq_data, rq_data, 12);
+
+	/* Insert 802.1Q VLAN tag: EtherType 0x8100, then TCI (PCP=0, DEI=0, VID) */
+	sq_data[12] = 0x81;
+	sq_data[13] = 0x00;
+	sq_data[14] = (IDS_MIRROR_VLAN_ID >> 8) & 0x0F;
+	sq_data[15] = IDS_MIRROR_VLAN_ID & 0xFF;
+
+	/* Copy original EtherType + payload after the inserted tag */
+	memcpy(sq_data + 16, rq_data + 12, data_sz - 12);
+
+	/* Control segment: identifies this WQE and requests CQE only on error */
+	swqe = get_next_sqe(&sq_ctx, SQ_IDX_MASK);
+	flexio_dev_swqe_seg_ctrl_set(swqe, sq_ctx.sq_pi, sq_ctx.sq_number,
+				     FLEXIO_CTRL_SEG_CE_CQE_ON_CQE_ERROR,
+				     FLEXIO_CTRL_SEG_TYPE_SEND_EN);
+
+	/* Ethernet inline segment: no VLAN, no checksum offload */
+	swqe = get_next_sqe(&sq_ctx, SQ_IDX_MASK);
+	flexio_dev_swqe_seg_eth_set(swqe, 0, 0, 0, NULL);
+
+	/* Data segment: tagged_sz = data_sz + 4 (VLAN header inserted above) */
+	swqe = get_next_sqe(&sq_ctx, SQ_IDX_MASK);
+	flexio_dev_swqe_seg_mem_ptr_data_set(swqe, tagged_sz, sq_lkey, (uint64_t)sq_data);
+
+	/* 4th segment slot must be consumed to align the ring */
+	swqe = get_next_sqe(&sq_ctx, SQ_IDX_MASK);
+	(void)swqe;
+
+	/* Fence, ring doorbell, fence */
+	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
+	flexio_dev_qp_sq_ring_db(++sq_ctx.sq_pi, sq_ctx.sq_number);
+	__dpa_thread_fence(__DPA_MEMORY, __DPA_W, __DPA_W);
+}
 
 /*
  * Rebuild cq_ctx_t (Completion Queue context) from the persisted state
@@ -81,24 +145,6 @@ static inline uint16_t be16(const uint8_t *p)
  * transport protocol is TCP or UDP.  Silently returns for non-IPv4
  * frames or truncated packets.
  */
-
-char *get_src_ip(const char *data, uint32_t size) {
-	char *out;
-	const uint8_t *p = (const uint8_t *)data;
-	const uint8_t *ip  = p + ETH_HDR_LEN;
-	const uint8_t *s = ip + IP_SRC_OFFSET;
-	sprintf(out, "%u.%u.%u.%u", s[0], s[1], s[2], s[3]);
-	return out;
-}
-
-char *get_dst_ip(const char *data, uint32_t size) {
-	char *out;
-	const uint8_t *p = (const uint8_t *)data;
-	const uint8_t *ip  = p + ETH_HDR_LEN;
-	const uint8_t *d = ip + IP_DST_OFFSET;
-	sprintf(out, "%u.%u.%u.%u", d[0], d[1], d[2], d[3]);
-	return out;
-}
 
 static int check_for_packet_type(const char *data, uint32_t size)
 {
@@ -217,6 +263,14 @@ __dpa_global__ void packet_printer_dev(uint64_t thread_arg)
 		/* Save initial CQ (Completion Queue) state into the persistent data block */
 		d->cq_idx          = rq_cq_ctx.cq_idx;
 		d->cq_hw_owner_bit = rq_cq_ctx.cq_hw_owner_bit;
+
+		/* Initialise SQ (Send Queue) context for TCP forwarding to ARM */
+		com_sq_ctx_init(&sq_ctx,
+				d->sq_transf.wq_num,
+				d->sq_transf.wq_ring_daddr);
+		com_dt_ctx_init(&dt_ctx, d->sq_transf.wqd_daddr);
+		sq_lkey = d->sq_transf.wqd_mkey_id;
+
 		d->not_first_run   = 1;
 	} else {
 		restore_cq_ctx(&rq_cq_ctx, d);
@@ -251,10 +305,12 @@ __dpa_global__ void packet_printer_dev(uint64_t thread_arg)
 
 		flexio_dev_print("--- Packet #%lu  len=%u ---\n",
 				 d->packets_count + local_count, data_sz);
-		/* Identify and summarise TCP/UDP flows */
-		check_for_packet_type(rq_data, data_sz);
-		/* Print packet content as raw characters */
-		//print_packet_chars(rq_data, data_sz);
+
+		/* Identify TCP/UDP and forward TCP packets to the ARM core via SQ */
+		if (check_for_packet_type(rq_data, data_sz) == 1) {
+			forward_tcp_packet(rq_data, data_sz);
+			d->tcp_forwarded++;
+		}
 
 		/* Advance RQ (Receive Queue) PI (Producer Index) via DBR (Doorbell Record)
 		 * to return the WQE (Work Queue Entry) buffer back to HW (Hardware) */

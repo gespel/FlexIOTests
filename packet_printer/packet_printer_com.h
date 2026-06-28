@@ -11,6 +11,15 @@
 /* Queue depth as power-of-2 exponent */
 #define LOG_CQ_DEPTH 7  /* CQ (Completion Queue) depth = 2^7 = 128 entries */
 #define LOG_RQ_DEPTH 7  /* RQ (Receive Queue)     depth = 2^7 = 128 entries */
+#define LOG_SQ_DEPTH 7  /* SQ (Send Queue)        depth = 2^7 = 128 entries */
+
+/* log2 of per-entry TX data buffer size (2048 bytes per slot) */
+#define LOG_WQD_CHUNK_BSIZE 11
+
+/* VLAN ID inserted into DPA-forwarded packets so they arrive on a dedicated
+ * ARM interface (e.g. "ip link add link p0 name ids0 type vlan id 4000").
+ * Normal traffic is untagged and never appears on that interface. */
+#define IDS_MIRROR_VLAN_ID 4000
 
 /* CQ (Completion Queue) data passed from host to DPA (Data Path Accelerator) */
 struct app_transfer_cq {
@@ -38,6 +47,8 @@ struct app_transfer_wq {
 struct host2dev_packet_printer_data {
 	struct app_transfer_cq rq_cq_transf;  /* RQ (Receive Queue) CQ (Completion Queue) transfer info */
 	struct app_transfer_wq rq_transf;     /* RQ (Receive Queue) transfer info */
+	struct app_transfer_cq sq_cq_transf;  /* SQ (Send Queue) CQ (Completion Queue) transfer info */
+	struct app_transfer_wq sq_transf;     /* SQ (Send Queue) transfer info — for TCP forwarding to ARM */
 
 	uint8_t  not_first_run;       /* lifecycle flag: 0 on first invocation, DPA (Data Path Accelerator) sets to 1 */
 	uint8_t  cq_hw_owner_bit;     /* CQ (Completion Queue) hardware owner bit — toggles on ring wrap-around */
@@ -45,6 +56,7 @@ struct host2dev_packet_printer_data {
 	uint32_t cq_idx;              /* CQ (Completion Queue) consumer index, persisted across invocations */
 
 	uint64_t packets_count;       /* total packets processed, maintained by DPA (Data Path Accelerator) */
+	uint64_t tcp_forwarded;       /* total TCP packets forwarded to ARM, maintained by DPA */
 } __attribute__((__packed__, aligned(8)));
 
 #endif /* __PACKET_PRINTER_COM_H__ */

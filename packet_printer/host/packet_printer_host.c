@@ -49,6 +49,10 @@ extern flexio_func_t packet_printer_dev;
 #define RQ_WQE_BSIZE         L2V(LOG_RQ_WQE_BSIZE)  /* RQ (Receive Queue) WQE (Work Queue Entry) size in bytes */
 #define RQ_RING_BSIZE        (Q_DEPTH * RQ_WQE_BSIZE)  /* RQ (Receive Queue) ring size in bytes */
 
+#define LOG_SQ_WQE_BSIZE     6                          /* log2 of SQ (Send Queue) WQE segment size = 64 bytes */
+#define SQ_WQE_BSIZE         L2V(LOG_SQ_WQE_BSIZE)     /* SQ (Send Queue) WQE segment size in bytes */
+#define SQ_RING_BSIZE        (Q_DEPTH * SQ_WQE_BSIZE)  /* SQ (Send Queue) ring size in bytes */
+
 /*
  * Full hardware fte_match_param (Flow Table Entry match parameter) size in bytes.
  * Used for both the catch-all mask and match value.
@@ -71,16 +75,24 @@ struct app_context {
 	struct flexio_rq            *rq;        /* RQ (Receive Queue): receives incoming packets */
 	struct flexio_mkey          *rqd_mkey;  /* MKey (Memory Key) for the RQ (Receive Queue) data buffer */
 
+	struct flexio_cq            *sq_cq;     /* CQ (Completion Queue) for the SQ (Send Queue) — collects send completions */
+	struct flexio_sq            *sq;        /* SQ (Send Queue): forwards TCP packets to ARM interface */
+	struct flexio_mkey          *sqd_mkey;  /* MKey (Memory Key) for the SQ (Send Queue) TX data buffer */
+
 	struct app_transfer_cq       rq_cq_transf;  /* CQ (Completion Queue) info sent to DPA (Data Path Accelerator) */
 	struct app_transfer_wq       rq_transf;      /* RQ (Receive Queue) info sent to DPA (Data Path Accelerator) */
+	struct app_transfer_cq       sq_cq_transf;   /* SQ CQ info sent to DPA */
+	struct app_transfer_wq       sq_transf;      /* SQ (Send Queue) info sent to DPA */
 	flexio_uintptr_t             app_data_daddr; /* DPA (Data Path Accelerator) heap address of the host2dev struct */
 
 	/* SW (Software) steering resources — DR (Direct Rules) API */
-	struct mlx5dv_dr_domain  *dr_domain;     /* DR (Direct Rules) domain: NIC_RX (Network Interface Card Receive) */
-	struct mlx5dv_dr_table   *dr_table;      /* DR (Direct Rules) flow table at level 0 */
-	struct mlx5dv_dr_matcher *dr_matcher;    /* DR (Direct Rules) matcher: catch-all (empty mask) */
-	struct mlx5dv_dr_action  *dr_tir_action; /* DR (Direct Rules) action: forward to TIR (Transport Interface Receive) */
-	struct mlx5dv_dr_rule    *dr_rule;       /* DR (Direct Rules) rule: binds matcher to action */
+	struct mlx5dv_dr_domain  *dr_domain;            /* DR domain: NIC_RX */
+	struct mlx5dv_dr_table   *dr_table;             /* DR flow table at level 0 */
+	struct mlx5dv_dr_matcher *dr_matcher;           /* DR matcher: catch-all (empty mask) */
+	struct mlx5dv_dr_action  *dr_tir_action;        /* DR action: copy to DPA TIR */
+	struct mlx5dv_dr_action  *dr_default_miss;      /* DR action: pass to normal RSS (ARM network stack) */
+	struct mlx5dv_dr_action  *dr_mirror_action;     /* DR action: dest_array — mirrors to both RSS and DPA */
+	struct mlx5dv_dr_rule    *dr_rule;              /* DR rule: binds matcher to mirror action */
 };
 
 /* ------------------------------------------------------------------ */
@@ -324,19 +336,100 @@ static int create_rq_cq(struct app_context *ctx)
 }
 
 /* ------------------------------------------------------------------ */
-/* Catch-all SW (Software) steering:                                   */
-/* forward all NIC_RX (Network Interface Card Receive) traffic to our  */
-/* RQ (Receive Queue) via a DR (Direct Rules) catch-all rule           */
+/* Allocate SQ (Send Queue) memory on DPA (Data Path Accelerator) heap */
+/* ------------------------------------------------------------------ */
+static int sq_mem_alloc(struct flexio_process *proc,
+			struct app_transfer_wq *sq_transf)
+{
+	/* TX data buffer: DPA copies packet payload here before posting the WQE */
+	if (flexio_buf_dev_alloc(proc, Q_DATA_BSIZE, &sq_transf->wqd_daddr) ||
+	    !sq_transf->wqd_daddr)
+		return -1;
+	/* SQ (Send Queue) ring: array of WQE (Work Queue Entry) segments */
+	if (flexio_buf_dev_alloc(proc, SQ_RING_BSIZE, &sq_transf->wq_ring_daddr) ||
+	    !sq_transf->wq_ring_daddr)
+		return -1;
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Create SQ (Send Queue) + its CQ (Completion Queue)                  */
+/* The SQ is used by the DPA to forward TCP packets to the ARM core.   */
+/* ------------------------------------------------------------------ */
+static int create_sq_cq(struct app_context *ctx)
+{
+	struct flexio_process *proc = ctx->process;
+	uint32_t uar_id = flexio_uar_get_id(ctx->uar);
+	struct flexio_cq_attr sqcq_attr = {0};
+	struct flexio_wq_attr sq_attr   = {0};
+	uint32_t cq_num;
+
+	/* Allocate SQ CQ (Completion Queue) ring + DBR (Doorbell Record) on DPA heap */
+	if (cq_mem_alloc(proc, &ctx->sq_cq_transf)) {
+		fprintf(stderr, "cq_mem_alloc for SQ CQ failed\n");
+		return -1;
+	}
+	sqcq_attr.log_cq_depth       = LOG_Q_DEPTH;
+	/* NON_DPA_CQ: send completions are collected but do not retrigger the DPA handler */
+	sqcq_attr.element_type       = FLEXIO_CQ_ELEMENT_TYPE_NON_DPA_CQ;
+	sqcq_attr.uar_id             = uar_id;
+	sqcq_attr.cq_dbr_daddr       = ctx->sq_cq_transf.cq_dbr_daddr;
+	sqcq_attr.cq_ring_qmem.daddr = ctx->sq_cq_transf.cq_ring_daddr;
+
+	if (flexio_cq_create(proc, NULL, &sqcq_attr, &ctx->sq_cq)) {
+		fprintf(stderr, "flexio_cq_create for SQ failed\n");
+		return -1;
+	}
+	cq_num = flexio_cq_get_cq_num(ctx->sq_cq);
+	ctx->sq_cq_transf.cq_num       = cq_num;
+	ctx->sq_cq_transf.log_cq_depth = LOG_Q_DEPTH;
+
+	/* Allocate SQ TX data buffer + ring on DPA heap */
+	if (sq_mem_alloc(proc, &ctx->sq_transf)) {
+		fprintf(stderr, "sq_mem_alloc failed\n");
+		return -1;
+	}
+
+	/* Create MKey (Memory Key) so HW (Hardware) can DMA TX data out of the SQ buffer */
+	ctx->sqd_mkey = create_dpa_mkey(ctx, ctx->sq_transf.wqd_daddr);
+	if (!ctx->sqd_mkey) {
+		fprintf(stderr, "create_dpa_mkey for SQ failed\n");
+		return -1;
+	}
+	ctx->sq_transf.wqd_mkey_id = flexio_mkey_get_id(ctx->sqd_mkey);
+
+	sq_attr.log_wq_depth        = LOG_Q_DEPTH;
+	sq_attr.pd                  = ctx->pd;
+	sq_attr.uar_id              = uar_id;
+	sq_attr.wq_ring_qmem.daddr  = ctx->sq_transf.wq_ring_daddr;
+
+	if (flexio_sq_create(proc, NULL, cq_num, &sq_attr, &ctx->sq)) {
+		fprintf(stderr, "flexio_sq_create failed\n");
+		return -1;
+	}
+	ctx->sq_transf.wq_num = flexio_sq_get_wq_num(ctx->sq);
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Mirror steering (IDS out-of-band):                                  */
+/* Every incoming packet is sent to BOTH the normal RSS path (ARM      */
+/* network stack) AND the DPA RQ (for inspection/pre-filtering).       */
+/* The original data path is never interrupted — IDS, not IPS.         */
 /* ------------------------------------------------------------------ */
 static int create_steering(struct app_context *ctx)
 {
 	/* Allocate enough memory for mlx5dv_flow_match_parameters + 512-byte HW match buffer */
 	size_t params_sz = sizeof(struct mlx5dv_flow_match_parameters) + MATCH_PARAM_SZ;
 	struct mlx5dv_flow_match_parameters *mask;
-	/* TIR (Transport Interface Receive): HW object that maps a flow to an RQ (Receive Queue) */
 	struct mlx5dv_devx_obj *tir;
 
-	/* Create NIC_RX (Network Interface Card Receive) DR (Direct Rules) domain */
+	/* Two-entry dest_array: [0] normal RSS, [1] DPA TIR */
+	struct mlx5dv_dr_action_dest_attr dest_normal  = { .type = MLX5DV_DR_ACTION_DEST };
+	struct mlx5dv_dr_action_dest_attr dest_dpa     = { .type = MLX5DV_DR_ACTION_DEST };
+	struct mlx5dv_dr_action_dest_attr *dests[2]    = { &dest_normal, &dest_dpa };
+
 	ctx->dr_domain = mlx5dv_dr_domain_create(ctx->ibv_ctx,
 						  MLX5DV_DR_DOMAIN_TYPE_NIC_RX);
 	if (!ctx->dr_domain) {
@@ -344,7 +437,6 @@ static int create_steering(struct app_context *ctx)
 		return -1;
 	}
 
-	/* Create flow table at priority level 0 (root level) */
 	ctx->dr_table = mlx5dv_dr_table_create(ctx->dr_domain, 0);
 	if (!ctx->dr_table) {
 		fprintf(stderr, "mlx5dv_dr_table_create failed (errno %d)\n", errno);
@@ -356,7 +448,7 @@ static int create_steering(struct app_context *ctx)
 		return -1;
 	mask->match_sz = MATCH_PARAM_SZ;
 
-	/* criteria=0 (empty), all-zero mask/value → match every packet (catch-all) */
+	/* criteria=0, all-zero mask → match every incoming packet */
 	ctx->dr_matcher = mlx5dv_dr_matcher_create(ctx->dr_table, 0, 0, mask);
 	if (!ctx->dr_matcher) {
 		fprintf(stderr, "mlx5dv_dr_matcher_create failed (errno %d)\n", errno);
@@ -364,9 +456,18 @@ static int create_steering(struct app_context *ctx)
 		return -1;
 	}
 
-	/* Get the TIR (Transport Interface Receive) object associated with our RQ (Receive Queue) */
+	/* default_miss: packet falls through to the hardware RSS table →
+	 * delivered normally to the ARM network stack, unmodified */
+	ctx->dr_default_miss = mlx5dv_dr_action_create_default_miss();
+	if (!ctx->dr_default_miss) {
+		fprintf(stderr, "mlx5dv_dr_action_create_default_miss failed (errno %d)\n",
+			errno);
+		free(mask);
+		return -1;
+	}
+
+	/* DPA TIR: delivers a copy of the packet to our DPA RQ */
 	tir = flexio_rq_get_tir(ctx->rq);
-	/* Create a DR (Direct Rules) action that forwards matched packets to the TIR (Transport Interface Receive) */
 	ctx->dr_tir_action = mlx5dv_dr_action_create_dest_devx_tir(tir);
 	if (!ctx->dr_tir_action) {
 		fprintf(stderr, "mlx5dv_dr_action_create_dest_devx_tir failed (errno %d)\n",
@@ -375,9 +476,19 @@ static int create_steering(struct app_context *ctx)
 		return -1;
 	}
 
-	/* Install the catch-all DR (Direct Rules) rule: every packet → TIR (Transport Interface Receive) → RQ */
+	/* Mirror action: simultaneously delivers to both destinations */
+	dest_normal.dest = ctx->dr_default_miss;
+	dest_dpa.dest    = ctx->dr_tir_action;
+	ctx->dr_mirror_action = mlx5dv_dr_action_create_dest_array(ctx->dr_domain, 2, dests);
+	if (!ctx->dr_mirror_action) {
+		fprintf(stderr, "mlx5dv_dr_action_create_dest_array failed (errno %d)\n",
+			errno);
+		free(mask);
+		return -1;
+	}
+
 	ctx->dr_rule = mlx5dv_dr_rule_create(ctx->dr_matcher, mask, 1,
-					     &ctx->dr_tir_action);
+					     &ctx->dr_mirror_action);
 	free(mask);
 	if (!ctx->dr_rule) {
 		fprintf(stderr, "mlx5dv_dr_rule_create failed (errno %d)\n", errno);
@@ -397,6 +508,8 @@ static int start_handler(struct app_context *ctx)
 
 	h2d.rq_cq_transf  = ctx->rq_cq_transf;
 	h2d.rq_transf     = ctx->rq_transf;
+	h2d.sq_cq_transf  = ctx->sq_cq_transf;
+	h2d.sq_transf     = ctx->sq_transf;
 	h2d.not_first_run = 0;
 
 	/* Allocate DPA (Data Path Accelerator) heap memory and copy h2d struct into it */
@@ -421,8 +534,12 @@ static void cleanup(struct app_context *ctx)
 	/* DR (Direct Rules) resources — destroyed before their domain */
 	if (ctx->dr_rule)
 		mlx5dv_dr_rule_destroy(ctx->dr_rule);
+	if (ctx->dr_mirror_action)
+		mlx5dv_dr_action_destroy(ctx->dr_mirror_action);
 	if (ctx->dr_tir_action)
 		mlx5dv_dr_action_destroy(ctx->dr_tir_action);
+	if (ctx->dr_default_miss)
+		mlx5dv_dr_action_destroy(ctx->dr_default_miss);
 	if (ctx->dr_matcher)
 		mlx5dv_dr_matcher_destroy(ctx->dr_matcher);
 	if (ctx->dr_table)
@@ -433,6 +550,20 @@ static void cleanup(struct app_context *ctx)
 	/* DPA (Data Path Accelerator) heap allocations and FlexIO objects */
 	if (ctx->app_data_daddr)
 		flexio_buf_dev_free(ctx->process, ctx->app_data_daddr);
+	if (ctx->sq)
+		flexio_sq_destroy(ctx->sq);
+	if (ctx->sqd_mkey)
+		flexio_device_mkey_destroy(ctx->sqd_mkey);
+	if (ctx->sq_transf.wq_ring_daddr)
+		flexio_buf_dev_free(ctx->process, ctx->sq_transf.wq_ring_daddr);
+	if (ctx->sq_transf.wqd_daddr)
+		flexio_buf_dev_free(ctx->process, ctx->sq_transf.wqd_daddr);
+	if (ctx->sq_cq)
+		flexio_cq_destroy(ctx->sq_cq);
+	if (ctx->sq_cq_transf.cq_ring_daddr)
+		flexio_buf_dev_free(ctx->process, ctx->sq_cq_transf.cq_ring_daddr);
+	if (ctx->sq_cq_transf.cq_dbr_daddr)
+		flexio_buf_dev_free(ctx->process, ctx->sq_cq_transf.cq_dbr_daddr);
 	if (ctx->rq)
 		flexio_rq_destroy(ctx->rq);
 	if (ctx->rqd_mkey)
@@ -561,6 +692,13 @@ int main(int argc, char **argv)
 	}
 
 	if (create_rq_cq(&ctx)) {
+		err = -1;
+		goto cleanup;
+	}
+
+	/* Create SQ (Send Queue) for TCP packet forwarding to ARM core */
+	if (create_sq_cq(&ctx)) {
+		fprintf(stderr, "Failed to create SQ for TCP forwarding\n");
 		err = -1;
 		goto cleanup;
 	}
